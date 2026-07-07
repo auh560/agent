@@ -2181,3 +2181,535 @@ exceptions.py
 先不拆
 等进入 RAG / Tool Calling 后再自然拆分
 ```
+
+---
+
+## 59. 结构化输出
+
+今天开始学习结构化输出。
+
+普通模型回答适合人看：
+```text
+Agent 是一种可以根据目标调用工具完成任务的程序。
+```
+
+结构化输出适合程序解析：
+```json
+{
+  "answer": "Agent 是一种可以根据目标调用工具完成任务的程序。",
+  "confidence": "high",
+  "need_tool": false
+}
+```
+
+结构化输出的核心目标：
+```text
+让模型输出固定格式
+让 Python 程序可以稳定解析
+```
+
+---
+
+## 60. 要求模型只输出 JSON
+
+结构化输出 prompt 里要明确：
+```text
+只输出 JSON
+不要输出 Markdown
+不要输出代码块
+不要输出额外解释
+```
+
+原因：
+```text
+json.loads() 只能解析合法 JSON
+如果模型多输出“当然可以，下面是 JSON”，解析就会失败
+```
+
+字段也要写清楚：
+```text
+answer: string
+confidence: "low" | "medium" | "high"
+need_tool: boolean
+```
+
+prompt 是提前约束模型；Pydantic 是事后验证结果。
+
+---
+
+## 61. structured_output.py
+
+今天新增：
+```text
+structured_output.py
+```
+
+作用：
+```text
+输入一个问题
+-> 让模型只输出 JSON
+-> json.loads() 解析
+-> Pydantic 校验
+-> 打印结构化字段
+```
+
+核心链路：
+```text
+模型输出字符串
+-> json.loads()
+-> Python dict
+-> StructuredOutput.model_validate()
+-> StructuredOutput 对象
+```
+
+---
+
+## 62. StructuredOutput 模型
+
+结构化输出模型：
+```python
+class StructuredOutput(BaseModel):
+    answer: str = Field(min_length=1)
+    confidence: Literal["low", "medium", "high"]
+    need_tool: bool
+```
+
+含义：
+```text
+answer：非空字符串
+confidence：只能是 low / medium / high
+need_tool：布尔值
+```
+
+`Literal["low", "medium", "high"]` 表示：
+```text
+字段只能取固定几个值
+```
+
+适合：
+```text
+分类
+状态
+动作类型
+工具名称
+置信度
+```
+
+---
+
+## 63. field_validator
+
+为了防止 answer 是纯空格，增加了：
+```python
+@field_validator("answer")
+@classmethod
+def answer_must_not_be_blank(cls, value: str) -> str:
+    stripped_value = value.strip()
+    if not stripped_value:
+        raise ValueError("answer must not be blank")
+    return stripped_value
+```
+
+这句：
+```python
+if not isinstance(answer, str) or not answer.strip():
+```
+
+可以理解为：
+```text
+如果 answer 不是字符串，或者去掉空格后是空字符串，就不合法
+```
+
+---
+
+## 64. model_validate
+
+`model_validate()` 是 Pydantic `BaseModel` 提供的方法。
+
+因为：
+```python
+class StructuredOutput(BaseModel):
+    ...
+```
+
+所以可以调用：
+```python
+StructuredOutput.model_validate(parsed_output)
+```
+
+作用：
+```text
+拿一份外部数据
+按照 StructuredOutput 的字段和规则进行校验
+校验通过 -> 返回 StructuredOutput 对象
+校验失败 -> 抛 ValidationError
+```
+
+---
+
+## 65. dict 和 Pydantic 对象
+
+`json.loads()` 得到的是普通 dict：
+```python
+parsed_output["answer"]
+```
+
+`model_validate()` 得到的是 Pydantic 对象：
+```python
+structured_output.answer
+```
+
+区别：
+```text
+dict 是原始数据，字段和类型不可靠
+Pydantic 对象是校验后的数据，字段和类型更可靠
+```
+
+结构化输出推荐流程：
+```text
+模型字符串
+-> json.loads()
+-> dict
+-> model_validate()
+-> Pydantic 对象
+-> 业务逻辑使用
+```
+
+---
+
+## 66. JSONDecodeError 和 ValidationError
+
+结构化输出有两类常见失败：
+```text
+JSONDecodeError：模型输出不是合法 JSON
+ValidationError：JSON 合法，但字段结构不符合要求
+```
+
+例子：
+```text
+模型多输出解释文字 -> JSONDecodeError
+confidence 输出 "sure" -> ValidationError
+```
+
+这说明：
+```text
+先检查是不是合法 JSON
+再检查是不是符合 schema
+```
+
+---
+
+## 67. 结构化输出修复
+
+今天给 `structured_output.py` 增加了一次修复机会。
+
+流程：
+```text
+第一次调用模型
+-> 解析或校验失败
+-> 把错误信息和原始输出发回模型
+-> 要求模型重新输出合法 JSON
+-> 再解析一次
+```
+
+修复时保留：
+```text
+模型刚才的错误输出
+解析/校验错误信息
+修复要求
+```
+
+注意：
+```text
+只重试有限次数
+当前只重试一次
+```
+
+---
+
+## 68. Tool Decision
+
+今天新增：
+```text
+tool_decision.py
+```
+
+目标：
+```text
+让模型不直接回答，而是先输出工具决策
+```
+
+模型输出格式：
+```json
+{
+  "action": "calculator",
+  "arguments": {
+    "expression": "12 * 8 + 3"
+  }
+}
+```
+
+字段含义：
+```text
+action：动作 / 工具名
+arguments：工具参数
+```
+
+---
+
+## 69. ToolDecision 模型
+
+工具决策模型：
+```python
+class ToolDecision(BaseModel):
+    action: Literal["final_answer", "search_docs", "calculator"]
+    arguments: dict[str, Any]
+```
+
+含义：
+```text
+action 只能是 final_answer / search_docs / calculator
+arguments 是工具参数字典
+```
+
+`arguments` 中文可以叫：
+```text
+工具参数
+```
+
+例如：
+```json
+{
+  "arguments": {
+    "expression": "12 * 8 + 3"
+  }
+}
+```
+
+表示：
+```text
+调用工具时传入 expression 参数
+```
+
+---
+
+## 70. 工具参数模型
+
+为了让工具参数更严格，给每个工具定义参数模型：
+```python
+class FinalAnswerArguments(BaseModel):
+    answer: str
+
+class CalculatorArguments(BaseModel):
+    expression: str
+
+class SearchDocsArguments(BaseModel):
+    query: str
+```
+
+两层校验：
+```text
+ToolDecision 校验 action 是否允许
+Arguments 模型校验工具参数是否正确
+```
+
+例如：
+```text
+calculator 必须有 expression
+search_docs 必须有 query
+```
+
+---
+
+## 71. 工具执行
+
+工具本质上是普通 Python 函数。
+
+例如 calculator：
+```python
+def calculator(expression: str) -> str:
+    ...
+```
+
+模型不会真的执行工具。
+
+模型负责输出：
+```text
+action + arguments
+```
+
+Python 负责：
+```text
+校验参数
+执行工具函数
+返回工具结果
+```
+
+Agent 的关键边界：
+```text
+模型负责决策
+程序负责执行
+```
+
+---
+
+## 72. calculator 工具
+
+今天实现了学习版计算器：
+```python
+def calculator(expression: str) -> str:
+    allowed_chars = set("0123456789+-*/(). ")
+    if any(char not in allowed_chars for char in expression):
+        raise ValueError("expression contains unsupported characters")
+
+    result = eval(expression, {"__builtins__": {}}, {})
+    return str(result)
+```
+
+安全限制：
+```text
+只允许数字、空格、+ - * / ( ) .
+禁用 __builtins__
+```
+
+注意：
+```text
+这是学习版，不是生产级沙箱
+```
+
+---
+
+## 73. 工具注册表
+
+最开始可以用 if/else 分发工具。
+
+工具多了以后，更适合工具注册表：
+```python
+@dataclass(frozen=True)
+class Tool:
+    function: Any
+    arguments_model: type[BaseModel]
+
+TOOLS: dict[str, Tool] = {
+    "calculator": Tool(
+        function=calculator,
+        arguments_model=CalculatorArguments,
+    ),
+    "search_docs": Tool(
+        function=search_docs,
+        arguments_model=SearchDocsArguments,
+    ),
+}
+```
+
+含义：
+```text
+工具名 -> 工具函数 + 参数模型
+```
+
+新增工具时：
+```text
+1. 写 Arguments 模型
+2. 写工具函数
+3. 注册到 TOOLS
+```
+
+---
+
+## 74. arguments 展开
+
+当前工具执行：
+```python
+args = tool.arguments_model.model_validate(decision.arguments)
+return tool.function(**args.model_dump())
+```
+
+`args.model_dump()` 会把 Pydantic 对象转成 dict。
+
+例如：
+```python
+{"expression": "12*8+3"}
+```
+
+`**` 表示把字典展开成关键字参数：
+```python
+calculator(**{"expression": "12*8+3"})
+```
+
+等价于：
+```python
+calculator(expression="12*8+3")
+```
+
+区别：
+```text
+*list：展开列表/元组
+**dict：展开字典
+```
+
+---
+
+## 75. search_docs 最小实现
+
+今天实现了最小版 `search_docs`：
+```python
+def search_docs(query: str) -> str:
+    note_dir = Path("note")
+    ...
+```
+
+功能：
+```text
+搜索 note/*.md
+大小写不敏感匹配 query
+返回最多 5 条命中
+每条包含文件名、行号和命中文本
+```
+
+例如：
+```text
+search_docs("Agent")
+```
+
+会返回：
+```text
+note/agent_learning_path.md:1: ...
+note/agent_learning_path.md:6: ...
+```
+
+这已经是一个真实工具。
+
+---
+
+## 76. 最小 Agent Loop
+
+当前 `tool_decision.py` 已经形成最小 Agent loop：
+```text
+用户任务
+-> 模型输出工具决策 JSON
+-> Pydantic 校验
+-> Python 执行工具
+-> 得到 tool_result
+-> 把工具结果交给模型
+-> 模型生成最终回答
+```
+
+对应 Agent 概念：
+```text
+Task
+-> Decide
+-> Validate
+-> Act
+-> Observe
+-> Answer
+```
+
+当前还不是完整 Agent，因为：
+```text
+只允许一次工具调用
+没有多步循环
+没有长期记忆
+没有 RAG 检索链路
+```
+
+但它已经具备 Agent 的基本骨架。
