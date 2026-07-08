@@ -2713,3 +2713,699 @@ Task
 ```
 
 但它已经具备 Agent 的基本骨架。
+
+---
+
+## 77. RAG 是什么
+
+RAG 全称是：
+```text
+Retrieval-Augmented Generation
+```
+
+中文可以理解为：
+```text
+检索增强生成
+```
+
+普通 LLM 流程：
+```text
+用户问题 -> 模型直接回答
+```
+
+RAG 流程：
+```text
+用户问题
+-> 检索相关资料
+-> 把资料和问题一起交给模型
+-> 模型基于资料回答
+```
+
+RAG 的核心作用：
+```text
+让模型先翻资料，再回答问题
+```
+
+---
+
+## 78. chunk 是什么
+
+chunk 是文档切分后的一个小片段。
+
+长文档不能全部塞给模型，因为：
+```text
+上下文有限
+token 成本高
+无关内容会干扰回答
+```
+
+所以要把文档切成多个 chunk：
+```text
+长文档 -> chunk1, chunk2, chunk3...
+```
+
+chunk 的目标：
+```text
+短，但语义尽量完整
+```
+
+当前学习版先按段落切：
+```python
+for paragraph in text.split("\n\n"):
+    chunk = paragraph.strip()
+```
+
+---
+
+## 79. 关键词版 RAG
+
+文件：
+```text
+keyword_rag.py
+```
+
+流程：
+```text
+读取 note/*.md
+-> 按段落切 chunk
+-> 根据关键词搜索 chunk
+-> 拼 RAG prompt
+-> 调用 LLM 回答
+```
+
+核心函数：
+```python
+load_markdown_files()
+split_into_chunks()
+build_chunks()
+search_chunks()
+build_rag_prompt()
+```
+
+关键词版 RAG 优点：
+```text
+简单
+不用 embedding
+不消耗 embedding token
+```
+
+缺点：
+```text
+主要依赖字面匹配
+不太懂语义
+中文拆词能力弱
+```
+
+---
+
+## 80. RAG Prompt
+
+当前 RAG prompt 写在：
+```text
+keyword_rag.py
+```
+
+函数：
+```python
+def build_rag_prompt(query: str, results: list[dict]) -> str:
+```
+
+它会把检索结果和用户问题拼成：
+```text
+Context:
+检索到的资料
+
+Question:
+用户问题
+```
+
+并要求模型：
+```text
+只基于资料回答
+资料不足就说明信息不足
+合并重复信息，不要重复同一个观点
+```
+
+虽然 `vector_rag.py` 和 `hybrid_rag.py` 是向量/混合检索，但它们也复用了这个 prompt。
+
+---
+
+## 81. embedding 是什么
+
+embedding 是把文本转换成向量：
+```text
+"BaseModel 是什么" -> [0.12, -0.45, 0.88, ...]
+```
+
+向量是一串数字。
+
+有了向量以后，程序可以比较两段文本的语义相似度。
+
+RAG 中 embedding 的用途：
+```text
+chunk -> embedding
+用户问题 -> embedding
+比较问题向量和 chunk 向量
+找到最相关的 chunk
+```
+
+---
+
+## 82. embedding_client.py
+
+文件：
+```text
+embedding_client.py
+```
+
+作用：
+```text
+调用 embedding API，把文本转成向量
+```
+
+核心函数：
+```python
+def get_embedding(text: str) -> EmbeddingResult:
+```
+
+输入：
+```text
+hello
+```
+
+输出：
+```text
+1536 维向量
+usage
+elapsed_seconds
+```
+
+它和 `llm_client.py` 的区别：
+```text
+llm_client.py: 文本/消息 -> 模型回答
+embedding_client.py: 文本 -> 向量
+```
+
+---
+
+## 83. 聊天模型和 embedding 模型分开配置
+
+当前 `config.py` 中已经拆分：
+```text
+聊天模型配置：
+OPENAI_BASE_URL
+OPENAI_API_KEY
+OPENAI_MODEL
+
+embedding 模型配置：
+OPENAI_EMBEDDING_BASE_URL
+OPENAI_EMBEDDING_API_KEY
+OPENAI_EMBEDDING_MODEL
+```
+
+这样可以做到：
+```text
+聊天继续用原来的 OpenAI 兼容中转
+embedding 单独用阿里云百炼
+```
+
+示例：
+```powershell
+$env:OPENAI_EMBEDDING_BASE_URL="https://dashscope.aliyuncs.com/compatible-mode/v1"
+$env:OPENAI_EMBEDDING_API_KEY="你的阿里云百炼 API Key"
+$env:OPENAI_EMBEDDING_MODEL="text-embedding-v1"
+```
+
+---
+
+## 84. 构建向量索引
+
+文件：
+```text
+build_vector_index.py
+```
+
+作用：
+```text
+提前给所有 chunk 生成 embedding，并保存到 vector_index.json
+```
+
+流程：
+```text
+读取文档
+-> 切 chunk
+-> 对每个 chunk 调用 get_embedding()
+-> 保存 source、chunk_id、text、embedding
+```
+
+生成文件：
+```text
+vector_index.json
+```
+
+测试时可以限制数量：
+```powershell
+python .\build_vector_index.py --limit 50
+```
+
+不加 `--limit` 会处理全部 chunk，会消耗更多 embedding token。
+
+---
+
+## 85. vector_index.json 不提交 Git
+
+`vector_index.json` 是生成文件，不是源码。
+
+原因：
+```text
+文件可能很大
+里面是大量向量数字
+会随着文档和模型变化重新生成
+不适合人工阅读
+```
+
+所以加入 `.gitignore`：
+```gitignore
+vector_index.json
+vector_index/
+```
+
+原则：
+```text
+代码进 Git
+向量索引不进 Git
+```
+
+---
+
+## 86. 向量版 RAG
+
+文件：
+```text
+vector_rag.py
+```
+
+流程：
+```text
+读取 vector_index.json
+-> 给用户问题生成 embedding
+-> 和每个 chunk embedding 计算相似度
+-> 取 top_k 个最相关 chunk
+-> 拼 RAG prompt
+-> 调用 LLM 回答
+```
+
+核心函数：
+```python
+load_vector_index()
+cosine_similarity()
+search_similar_chunks()
+```
+
+向量版 RAG 相比关键词版：
+```text
+关键词版：按字面匹配
+向量版：按语义相似度匹配
+```
+
+---
+
+## 87. 余弦相似度
+
+余弦相似度用于判断两个向量是否相似。
+
+代码大概是：
+```python
+dot_product / (vector_a_length * vector_b_length)
+```
+
+含义：
+```text
+两个向量方向越接近，语义越相似
+```
+
+在 RAG 中：
+```text
+用户问题向量
+vs
+chunk 向量
+```
+
+相似度越高，越可能被检索出来。
+
+---
+
+## 88. top_k
+
+`top_k` 表示取相似度最高的前 k 个 chunk。
+
+例如：
+```python
+top_k = 5
+```
+
+表示取最相关的 5 条资料。
+
+影响：
+```text
+top_k 太小：可能漏掉重要信息
+top_k 太大：可能引入重复或无关资料，token 更多
+```
+
+学习阶段常用：
+```text
+top_k = 3 或 5
+```
+
+---
+
+## 89. Hybrid Search
+
+Hybrid Search 是混合检索：
+```text
+关键词检索 + 向量检索
+```
+
+文件：
+```text
+hybrid_rag.py
+```
+
+流程：
+```text
+向量检索 top 5
+-> 关键词检索 top 5
+-> 用 (source, chunk_id) 去重
+-> 合并结果
+-> 拼 prompt
+-> LLM 回答
+```
+
+核心函数：
+```python
+merge_results()
+hybrid_search()
+```
+
+为什么要 Hybrid：
+```text
+关键词检索适合精确词：BaseModel、model_validate、HTTPException
+向量检索适合语义问题：某个概念有什么作用
+```
+
+---
+
+## 90. Rerank
+
+Rerank 中文叫重排序。
+
+常见流程：
+```text
+向量检索先召回 top 20
+-> rerank 模型重新判断相关性
+-> 选出最好的 top 3 到 top 5
+-> 给 LLM 回答
+```
+
+理解：
+```text
+向量检索：粗筛
+rerank：精排
+```
+
+优点：
+```text
+减少无关 chunk
+减少重复资料
+提高回答准确性
+```
+
+缺点：
+```text
+多一次模型调用
+更慢
+多一点成本
+```
+
+---
+
+## 91. Metadata Filter
+
+metadata 是 chunk 的附加信息。
+
+例如：
+```json
+{
+  "source": "note/agent_learning_path.md",
+  "chunk_id": 19
+}
+```
+
+`source` 和 `chunk_id` 就是 metadata。
+
+Metadata Filter 是根据元数据过滤检索范围：
+```text
+只查某个文件
+只查某个标签
+只查某个时间范围
+```
+
+作用：
+```text
+缩小检索范围，让 RAG 更准
+```
+
+---
+
+## 92. Query Rewrite
+
+Query Rewrite 是查询改写。
+
+作用：
+```text
+把用户口语化的问题改写成更适合检索的问题
+```
+
+例如：
+```text
+用户问题：BaseModel 那个东西是干嘛的？
+改写后：Pydantic BaseModel 的作用是什么？
+```
+
+流程：
+```text
+用户原始问题
+-> LLM 改写检索 query
+-> 用改写后的 query 检索
+-> 用检索结果回答原始问题
+```
+
+---
+
+## 93. Multi-query Retrieval
+
+Multi-query Retrieval 是多查询检索。
+
+作用：
+```text
+把一个用户问题扩展成多个不同角度的检索问题
+```
+
+例如：
+```text
+RAG 怎么学？
+```
+
+可以扩展成：
+```text
+RAG 学习路线是什么？
+检索增强生成的学习步骤是什么？
+embedding 和向量检索怎么学习？
+本地知识库 RAG Agent 项目怎么做？
+```
+
+好处：
+```text
+覆盖更全
+不容易漏掉相关 chunk
+```
+
+缺点：
+```text
+检索次数更多
+可能引入重复内容
+```
+
+---
+
+## 94. Parent-Child Chunk
+
+Parent-Child Chunk 的核心：
+```text
+小 chunk 检索
+大 chunk 回答
+```
+
+原因：
+```text
+小 chunk 检索更准，但上下文少
+大 chunk 上下文完整，但检索不够精准
+```
+
+做法：
+```text
+用 child chunk 做检索
+找到相关 child 后
+返回它对应的 parent chunk 给模型
+```
+
+---
+
+## 95. Agentic RAG
+
+普通 RAG：
+```text
+固定检索一次，然后回答
+```
+
+Agentic RAG：
+```text
+Agent 自己判断要不要检索、检索什么、检索几次、结果够不够
+```
+
+它更像：
+```text
+Tool Calling + RAG 检索工具
+```
+
+当前代码还不是 Agentic RAG。
+
+当前代码：
+```text
+vector_rag.py: 固定做一次向量检索
+hybrid_rag.py: 固定做一次混合检索
+```
+
+未来可以把 RAG 检索封装成工具：
+```text
+search_vector_index(query)
+```
+
+再接入 Agent 决策。
+
+---
+
+## 96. Graph RAG
+
+Graph RAG 是基于知识图谱的 RAG。
+
+普通 RAG 检索文本 chunk。
+
+Graph RAG 更关注：
+```text
+实体
+关系
+结构
+```
+
+例如：
+```text
+小明 -> 负责 -> RAG 项目
+RAG 项目 -> 使用 -> FastAPI
+FastAPI 服务 -> 调用 -> 向量数据库
+```
+
+适合：
+```text
+人物关系
+公司组织
+项目依赖
+知识体系
+事件关系
+代码模块关系
+```
+
+它比普通 RAG 复杂，需要实体抽取、关系抽取、图数据库和图查询。
+
+---
+
+## 97. RAG 工程常见问题
+
+1. chunk 太大或太小
+
+```text
+太大：检索不精准，token 消耗高
+太小：上下文不完整
+```
+
+2. 索引更新问题
+
+文档变了，`vector_index.json` 不会自动更新。
+
+需要重新运行：
+```powershell
+python .\build_vector_index.py
+```
+
+3. 重复 chunk 问题
+
+解决方式：
+```text
+prompt 要求合并重复信息
+检索结果去重
+减少 top_k
+后面加 rerank
+```
+
+4. 来源引用问题
+
+真实 RAG 最好告诉用户答案来自哪里：
+```text
+note/agent_learning_path.md#19
+```
+
+5. 检索不到不等于没有答案
+
+可能原因：
+```text
+query 不好
+chunk 切分不好
+embedding 模型不适合
+top_k 太小
+```
+
+调试 RAG 时要先看：
+```text
+Retrieved chunks
+```
+
+---
+
+## 98. 当前 RAG 文件分工
+
+当前文件：
+```text
+keyword_rag.py          关键词版 RAG
+embedding_client.py     调用 embedding API
+build_vector_index.py   构建 vector_index.json
+vector_rag.py           向量版 RAG 查询
+hybrid_rag.py           混合检索 RAG
+```
+
+运行顺序：
+```text
+1. 先构建索引
+python .\build_vector_index.py --limit 50
+
+2. 向量 RAG 问答
+python .\vector_rag.py
+
+3. 混合检索 RAG 问答
+python .\hybrid_rag.py
+```
+
+注意：
+```text
+build_vector_index.py 不要频繁跑，会消耗 embedding token
+vector_rag.py / hybrid_rag.py 平时问答使用
+```
