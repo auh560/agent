@@ -1,4 +1,4 @@
-import re
+import re  #正则表达式
 from pathlib import Path
 
 from llm_client import (
@@ -23,7 +23,7 @@ STOP_WORDS = {
     "么",
 }
 
-
+#加载note下的所有.md文档->document
 def load_markdown_files(note_dir: Path = Path("note")) -> list[dict]:
     documents: list[dict] = []
 

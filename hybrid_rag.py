@@ -47,6 +47,26 @@ def hybrid_search(query: str, limit: int = 5) -> list[dict]:
     )
 
 
+def format_search_results(results: list[dict]) -> str:
+    if not results:
+        return "No relevant knowledge base chunks found."
+
+    formatted_results: list[str] = []
+
+    for index, result in enumerate(results, start=1):
+        formatted_results.append(
+            f"[{index}] source: {result['source']}, chunk_id: {result['chunk_id']}\n"
+            f"{result['text']}"
+        )
+
+    return "\n\n".join(formatted_results)
+
+
+def search_knowledge_base(query: str) -> str:
+    results = hybrid_search(query)
+    return format_search_results(results)
+
+
 def main() -> int:
     query = input("Query: ").strip()
     if not query:

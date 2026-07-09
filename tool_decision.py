@@ -5,7 +5,15 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ValidationError
 
-from llm_client import ChatMessage, Role, call_llm
+from hybrid_rag import search_knowledge_base
+from llm_client import (
+    ChatMessage,
+    ConfigError,
+    LLMAPIError,
+    LLMResponseError,
+    Role,
+    call_llm,
+)
 
 
 SYSTEM_PROMPT = """You are a tool decision assistant.
@@ -17,18 +25,20 @@ Do not output extra explanation.
 
 Available actions:
 - final_answer: use this when you can answer directly without tools
-- search_docs: use this when the user asks about local notes, documents, or project knowledge
+- search_docs: use this for simple exact keyword search in local markdown notes
+- search_knowledge_base: use this when the user asks about local notes, learning progress, project knowledge, or needs semantic RAG search
 - calculator: use this when the user asks for arithmetic or numeric calculation
 
 JSON schema:
 {
-  "action": "final_answer" | "search_docs" | "calculator",
+  "action": "final_answer" | "search_docs" | "search_knowledge_base" | "calculator",
   "arguments": object
 }
 
 Rules:
 - If action is final_answer, arguments must include "answer".
 - If action is search_docs, arguments must include "query".
+- If action is search_knowledge_base, arguments must include "query".
 - If action is calculator, arguments must include "expression".
 """
 
@@ -46,7 +56,7 @@ Please provide a concise final answer to the user.
 
 
 class ToolDecision(BaseModel):
-    action: Literal["final_answer", "search_docs", "calculator"]
+    action: Literal["final_answer", "search_docs", "search_knowledge_base", "calculator"]
     arguments: dict[str, Any]
 
 
@@ -59,6 +69,10 @@ class CalculatorArguments(BaseModel):
 
 
 class SearchDocsArguments(BaseModel):
+    query: str
+
+
+class SearchKnowledgeBaseArguments(BaseModel):
     query: str
 
 
@@ -109,6 +123,10 @@ TOOLS: dict[str, Tool] = {
     "search_docs": Tool(
         function=search_docs,
         arguments_model=SearchDocsArguments,
+    ),
+    "search_knowledge_base": Tool(
+        function=search_knowledge_base,
+        arguments_model=SearchKnowledgeBaseArguments,
     ),
 }
 
@@ -161,7 +179,7 @@ def main() -> int:
 
     try:
         tool_result = execute_tool_decision(decision)
-    except ValueError as exc:
+    except (ValueError, ConfigError, LLMAPIError, LLMResponseError) as exc:
         print("\nTool execution failed:")
         print(exc)
         return 1
@@ -178,7 +196,12 @@ def main() -> int:
         final_messages = [
             ChatMessage(role=Role.USER, content=final_prompt),
         ]
-        final_result = call_llm(final_messages)
+        try:
+            final_result = call_llm(final_messages)
+        except (ConfigError, LLMAPIError, LLMResponseError) as exc:
+            print("\nFinal answer generation failed:")
+            print(exc)
+            return 1
 
         print("\nFinal answer:")
         print(final_result.answer)

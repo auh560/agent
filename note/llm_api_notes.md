@@ -3409,3 +3409,396 @@ python .\hybrid_rag.py
 build_vector_index.py 不要频繁跑，会消耗 embedding token
 vector_rag.py / hybrid_rag.py 平时问答使用
 ```
+
+---
+
+## 99. RAG 工具化
+
+昨天的 RAG 文件可以单独运行：
+```powershell
+python .\vector_rag.py
+python .\hybrid_rag.py
+```
+
+这种形式是：
+```text
+独立 RAG 问答程序
+```
+
+今天开始把 RAG 变成 Agent 可以调用的工具：
+```python
+def search_knowledge_base(query: str) -> str:
+    ...
+```
+
+工具化后的职责：
+```text
+只负责检索资料
+返回相关 chunk
+不直接生成最终回答
+```
+
+最终回答仍然由 Agent 统一生成。
+
+---
+
+## 100. search_knowledge_base
+
+文件：
+```text
+hybrid_rag.py
+```
+
+新增函数：
+```python
+def format_search_results(results: list[dict]) -> str:
+    ...
+
+def search_knowledge_base(query: str) -> str:
+    results = hybrid_search(query)
+    return format_search_results(results)
+```
+
+`hybrid_search()` 返回的是 chunk 列表。
+
+Agent 工具更适合返回字符串，所以要格式化成：
+```text
+[1] source: note/agent_learning_path.md, chunk_id: 19
+chunk 内容...
+
+[2] source: note/llm_api_notes.md, chunk_id: 83
+chunk 内容...
+```
+
+一句话：
+```text
+search_knowledge_base 是给 Agent 调用的 RAG 检索工具
+```
+
+---
+
+## 101. tool_decision.py 接入 RAG 工具
+
+今天在 `tool_decision.py` 中新增了一个 action：
+```python
+"search_knowledge_base"
+```
+
+`ToolDecision` 从：
+```python
+Literal["final_answer", "search_docs", "calculator"]
+```
+
+变成：
+```python
+Literal[
+    "final_answer",
+    "search_docs",
+    "search_knowledge_base",
+    "calculator",
+]
+```
+
+新增参数模型：
+```python
+class SearchKnowledgeBaseArguments(BaseModel):
+    query: str
+```
+
+注册工具：
+```python
+"search_knowledge_base": Tool(
+    function=search_knowledge_base,
+    arguments_model=SearchKnowledgeBaseArguments,
+)
+```
+
+这样模型可以输出：
+```json
+{
+  "action": "search_knowledge_base",
+  "arguments": {
+    "query": "LLM 学习计划"
+  }
+}
+```
+
+---
+
+## 102. 最小 RAG Agent
+
+现在 `tool_decision.py` 已经是一个最小 RAG Agent。
+
+流程：
+```text
+用户问题
+-> 模型输出工具决策 JSON
+-> Python 解析并校验
+-> 如果 action 是 search_knowledge_base
+-> 调用 RAG 工具检索知识库
+-> 得到 tool_result
+-> 再把用户问题和 tool_result 交给模型
+-> 模型生成最终回答
+```
+
+它已经具备：
+```text
+Agent 决策
+RAG 工具
+最终回答生成
+```
+
+但它还是最小版，因为：
+```text
+只支持一次工具调用
+不会判断检索结果够不够
+不会自动换 query 再查
+没有多步工具循环
+```
+
+---
+
+## 103. traceback 是什么
+
+traceback 是 Python 的错误调用栈。
+
+当程序异常没有被捕获时，Python 会打印：
+```text
+Traceback (most recent call last):
+  File ...
+  File ...
+```
+
+它表示错误从哪个函数一路传出来。
+
+今天遇到过：
+```text
+tool_decision.py
+-> execute_tool_decision()
+-> search_knowledge_base()
+-> hybrid_search()
+-> search_similar_chunks()
+-> get_embedding()
+-> urllib 请求阿里云 embedding API
+-> HTTP 401
+```
+
+因为当时只捕获了 `ValueError`，没有捕获 `LLMAPIError`，所以异常一路冒泡，最终触发 traceback。
+
+---
+
+## 104. 分层异常处理
+
+Agent 中错误可能发生在不同层：
+```text
+模型决策层
+工具执行层
+最终回答层
+```
+
+模型决策层：
+```python
+decision = parse_tool_decision(result.answer)
+```
+
+可能错误：
+```text
+模型没有输出合法 JSON
+action 不符合 Literal
+arguments 格式不对
+```
+
+捕获：
+```python
+except (json.JSONDecodeError, ValidationError, ValueError)
+```
+
+工具执行层：
+```python
+tool_result = execute_tool_decision(decision)
+```
+
+可能错误：
+```text
+工具参数错误
+embedding API key 错
+embedding 服务失败
+vector_index.json 不存在
+```
+
+捕获：
+```python
+except (ValueError, ConfigError, LLMAPIError, LLMResponseError)
+```
+
+最终回答层：
+```python
+final_result = call_llm(final_messages)
+```
+
+可能错误：
+```text
+聊天模型 API 失败
+模型响应格式不对
+```
+
+捕获：
+```python
+except (ConfigError, LLMAPIError, LLMResponseError)
+```
+
+分层处理的好处：
+```text
+更容易知道是哪个阶段失败
+输出更友好
+避免直接 traceback
+```
+
+---
+
+## 105. 单步 Agent 和多步 Agent
+
+当前 `tool_decision.py` 是单步 Agent：
+```text
+决策一次
+-> 执行一次工具
+-> 最终回答
+```
+
+多步 Agent 是：
+```text
+决策
+-> 工具
+-> 观察结果
+-> 再决策
+-> 再工具
+-> 直到 final_answer
+```
+
+多步 Agent 的核心是循环：
+```python
+for step in range(max_steps):
+    decision = ask_model(...)
+    if decision.action == "final_answer":
+        return answer
+
+    tool_result = execute_tool(...)
+    scratchpad.append(...)
+```
+
+---
+
+## 106. scratchpad
+
+scratchpad 是 Agent 本次任务的临时工作记录。
+
+它记录：
+```text
+原始用户任务
+每一步模型决策
+每一步工具参数
+每一步工具返回结果
+```
+
+例如：
+```text
+Step 1:
+Action: search_knowledge_base
+Arguments: {"query": "当前学习进度"}
+Observation:
+检索到了 RAG 和 Agent 学习内容
+
+Step 2:
+Action: calculator
+Arguments: {"expression": "4 / 2"}
+Observation:
+2
+```
+
+scratchpad 不是长期记忆。
+
+它只在当前任务中存在，程序结束后就没了。
+
+---
+
+## 107. 多步 Agent 的停止条件
+
+多步 Agent 必须有停止条件，否则可能无限循环。
+
+常见停止条件：
+```text
+1. 模型输出 final_answer
+2. 达到 max_steps
+```
+
+正常停止：
+```json
+{
+  "action": "final_answer",
+  "arguments": {
+    "answer": "..."
+  }
+}
+```
+
+安全停止：
+```python
+max_steps = 5
+```
+
+如果 5 步后还没有最终答案，就返回：
+```text
+Agent stopped because max_steps was reached.
+```
+
+---
+
+## 108. multi_step_agent.py
+
+文件：
+```text
+multi_step_agent.py
+```
+
+作用：
+```text
+把 tool_decision.py 的单步 Agent 扩展成多步 Agent
+```
+
+核心函数：
+```python
+format_scratchpad()
+build_agent_messages()
+run_agent()
+```
+
+`format_scratchpad()`：
+```text
+把历史步骤列表拼成文本
+```
+
+`build_agent_messages()`：
+```text
+把用户任务、scratchpad、工具说明一起发给模型
+```
+
+`run_agent()`：
+```text
+负责多步循环
+```
+
+基本流程：
+```text
+初始化 scratchpad
+-> 最多循环 max_steps 次
+-> 每轮让模型输出 action
+-> 如果 final_answer 就结束
+-> 否则执行工具
+-> 把 observation 写入 scratchpad
+-> 进入下一轮
+```
+
+一句话：
+```text
+multi_step_agent.py 是在 tool_decision.py 外面套了一层循环和 scratchpad
+```
