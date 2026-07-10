@@ -1,6 +1,7 @@
 import json
+from typing import Any
 
-from pydantic import ValidationError
+from pydantic import BaseModel, Field, ValidationError
 
 from llm_client import (
     ChatMessage,
@@ -30,6 +31,32 @@ Do not repeat a tool call if the previous observation already contains enough in
 """
 
 
+class AgentStep(BaseModel):
+    step: int
+    action: str
+    arguments: dict[str, Any]
+    observation: str
+
+
+class AgentError(BaseModel):
+    step: int
+    error: str
+    action: str | None = None
+    arguments: dict[str, Any] | None = None
+
+
+class AgentState(BaseModel):
+    scratchpad: list[str] = Field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    steps: list[AgentStep] = Field(default_factory=list)
+    errors: list[AgentError] = Field(default_factory=list)
+
+
+class AgentResult(BaseModel):
+    answer: str
+    state: AgentState
+
+
 def format_scratchpad(scratchpad: list[str]) -> str:
     if not scratchpad:
         return "No previous steps."
@@ -56,11 +83,11 @@ Now decide the next action.
     ]
 
 
-def run_agent(user_request: str, max_steps: int = 5) -> str:
-    scratchpad: list[str] = []
+def run_agent(user_request: str, max_steps: int = 5) -> AgentResult:
+    state = AgentState()
 
     for step in range(1, max_steps + 1):
-        messages = build_agent_messages(user_request, scratchpad)
+        messages = build_agent_messages(user_request, state.scratchpad)
         result = call_llm(messages)
         decision = parse_tool_decision(result.answer)
 
@@ -68,15 +95,68 @@ def run_agent(user_request: str, max_steps: int = 5) -> str:
         print(f"action: {decision.action}")
         print(f"arguments: {decision.arguments}")
 
-        tool_result = execute_tool_decision(decision)
+        if decision.action != "final_answer":
+            current_call = {
+                "action": decision.action,
+                "arguments": decision.arguments,
+            }
+
+            if current_call in state.tool_calls:
+                state.errors.append(
+                    AgentError(
+                        step=step,
+                        action=decision.action,
+                        arguments=decision.arguments,
+                        error="repeated tool call",
+                    )
+                )
+                return AgentResult(
+                    answer="Agent stopped because it repeated the same tool call.",
+                    state=state,
+                )
+
+            state.tool_calls.append(current_call)
+
+        try:
+            tool_result = execute_tool_decision(decision)
+        except (ValidationError, ValueError, ConfigError, LLMAPIError, LLMResponseError) as exc:
+            state.errors.append(
+                AgentError(
+                    step=step,
+                    action=decision.action,
+                    arguments=decision.arguments,
+                    error=str(exc),
+                )
+            )
+            return AgentResult(
+                answer="Agent stopped because tool execution failed.",
+                state=state,
+            )
 
         if decision.action == "final_answer":
-            return tool_result
+            state.steps.append(
+                AgentStep(
+                    step=step,
+                    action=decision.action,
+                    arguments=decision.arguments,
+                    observation=tool_result,
+                )
+            )
+            return AgentResult(answer=tool_result, state=state)
 
         print("\nObservation:")
         print(tool_result)
 
-        scratchpad.append(
+        state.steps.append(
+            AgentStep(
+                step=step,
+                action=decision.action,
+                arguments=decision.arguments,
+                observation=tool_result,
+            )
+        )
+
+        state.scratchpad.append(
             f"""Step {step}:
 Action: {decision.action}
 Arguments: {decision.model_dump_json()}
@@ -85,7 +165,16 @@ Observation:
 """
         )
 
-    return "Agent stopped because max_steps was reached."
+    state.errors.append(
+        AgentError(
+            step=max_steps,
+            error="max_steps reached",
+        )
+    )
+    return AgentResult(
+        answer="Agent stopped because max_steps was reached.",
+        state=state,
+    )
 
 
 def main() -> int:
@@ -95,7 +184,7 @@ def main() -> int:
         return 1
 
     try:
-        answer = run_agent(user_request)
+        result = run_agent(user_request)
     except (json.JSONDecodeError, ValidationError, ValueError) as exc:
         print("\nAgent decision parsing or validation failed:")
         print(exc)
@@ -106,7 +195,7 @@ def main() -> int:
         return 1
 
     print("\nFinal answer:")
-    print(answer)
+    print(result.answer)
 
     return 0
 

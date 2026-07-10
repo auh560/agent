@@ -3802,3 +3802,809 @@ run_agent()
 ```text
 multi_step_agent.py 是在 tool_decision.py 外面套了一层循环和 scratchpad
 ```
+
+---
+
+## 109. Agent 为什么需要工程化控制
+
+Agent 不是普通函数。
+
+普通函数一般是：
+
+```text
+输入 -> 固定逻辑 -> 输出
+```
+
+Agent 更像是：
+
+```text
+输入 -> 模型判断下一步 -> 调用工具 -> 观察结果 -> 再判断 -> 最终回答
+```
+
+因为中间的决策由 LLM 参与，所以它可能出现：
+
+```text
+1. 重复调用同一个工具
+2. 调错工具
+3. 工具结果已经足够，但仍然继续搜索
+4. 达到最大步数仍然没有 final_answer
+```
+
+所以工程化 Agent 不能只依赖 prompt，还需要用代码加边界。
+
+常见控制方式：
+
+```text
+max_steps：限制最多执行几步
+tool_calls：记录工具调用，防止重复
+errors：记录失败原因
+steps：记录执行轨迹
+```
+
+一句话：
+
+```text
+模型负责决策，代码负责兜底。
+```
+
+---
+
+## 110. 防重复工具调用
+
+今天给 `multi_step_agent.py` 加了一个简单的防重复机制。
+
+核心思想：
+
+```text
+如果 action 和 arguments 都完全一样，就认为是重复工具调用。
+```
+
+例如允许：
+
+```json
+{"action": "search_knowledge_base", "arguments": {"query": "RAG"}}
+{"action": "search_knowledge_base", "arguments": {"query": "Agentic RAG"}}
+```
+
+因为 query 不同。
+
+但会拦住：
+
+```json
+{"action": "search_knowledge_base", "arguments": {"query": "RAG"}}
+{"action": "search_knowledge_base", "arguments": {"query": "RAG"}}
+```
+
+代码中的记录结构：
+
+```python
+current_call = {
+    "action": decision.action,
+    "arguments": decision.arguments,
+}
+```
+
+如果 `current_call` 已经在 `tool_calls` 里，就停止：
+
+```python
+if current_call in state.tool_calls:
+    ...
+```
+
+注意：
+
+```text
+final_answer 不算工具调用，不参与重复检查。
+```
+
+---
+
+## 111. Agent State
+
+Agent State 表示 Agent 当前运行过程中的状态。
+
+之前只有：
+
+```python
+scratchpad: list[str] = []
+```
+
+后来整理成：
+
+```python
+state = {
+    "scratchpad": [],
+    "tool_calls": [],
+    "steps": [],
+    "errors": [],
+}
+```
+
+它们的作用：
+
+```text
+scratchpad：给模型看的历史记录
+tool_calls：给程序判断重复工具调用
+steps：记录每一步执行轨迹
+errors：记录错误和停止原因
+```
+
+重点区别：
+
+```text
+scratchpad 是给 LLM 看的文本历史
+state 是给程序看的结构化状态
+```
+
+---
+
+## 112. Pydantic 版 AgentResult
+
+为了让 Agent 返回结果更规范，今天把普通 dict 升级成了 Pydantic 模型。
+
+主要结构：
+
+```python
+class AgentStep(BaseModel):
+    step: int
+    action: str
+    arguments: dict[str, Any]
+    observation: str
+
+
+class AgentError(BaseModel):
+    step: int
+    error: str
+    action: str | None = None
+    arguments: dict[str, Any] | None = None
+
+
+class AgentState(BaseModel):
+    scratchpad: list[str] = Field(default_factory=list)
+    tool_calls: list[dict[str, Any]] = Field(default_factory=list)
+    steps: list[AgentStep] = Field(default_factory=list)
+    errors: list[AgentError] = Field(default_factory=list)
+
+
+class AgentResult(BaseModel):
+    answer: str
+    state: AgentState
+```
+
+含义：
+
+```text
+AgentStep：记录一步执行
+AgentError：记录一个错误
+AgentState：记录整个运行过程
+AgentResult：记录最终答案 + 完整状态
+```
+
+为什么用 `Field(default_factory=list)`：
+
+```text
+表示每次创建对象时，都生成一个新的空列表。
+```
+
+这样比直接写 `=[]` 更安全，也更符合 Pydantic 的推荐写法。
+
+---
+
+## 113. run_agent 的返回值
+
+之前：
+
+```python
+def run_agent(...) -> str:
+```
+
+只返回最终答案字符串。
+
+现在：
+
+```python
+def run_agent(...) -> AgentResult:
+```
+
+返回结构化结果。
+
+这样可以同时拿到：
+
+```python
+result.answer
+result.state.steps
+result.state.errors
+result.state.tool_calls
+result.state.scratchpad
+```
+
+这一步的意义：
+
+```text
+run_agent 不再只是命令行 demo，而是可以被 FastAPI、日志系统、测试代码复用的工程函数。
+```
+
+---
+
+## 114. FastAPI 接入 Agent
+
+今天在 `api_server.py` 中新增了：
+
+```text
+POST /agent/chat
+```
+
+请求模型：
+
+```python
+class AgentChatRequest(BaseModel):
+    message: str
+    max_steps: int = 5
+```
+
+调用流程：
+
+```text
+用户请求 /agent/chat
+-> FastAPI 校验 message 和 max_steps
+-> 调用 run_agent()
+-> 得到 AgentResult
+-> 保存日志
+-> 返回对外响应
+```
+
+测试请求示例：
+
+```json
+{
+  "message": "根据我的学习笔记，说一下 RAG 是什么",
+  "max_steps": 5
+}
+```
+
+---
+
+## 115. 内部状态和对外响应分离
+
+`run_agent()` 内部返回完整的：
+
+```python
+AgentResult
+```
+
+里面有：
+
+```text
+answer
+state.scratchpad
+state.tool_calls
+state.steps
+state.errors
+```
+
+但是 `/agent/chat` 对外不直接暴露完整 state。
+
+对外响应模型：
+
+```python
+class AgentPublicStep(BaseModel):
+    step: int
+    action: str
+    arguments: dict
+
+
+class AgentChatResponse(BaseModel):
+    answer: str
+    steps: list[AgentPublicStep]
+    errors: list[AgentError]
+```
+
+为什么不把完整 state 都返回给用户：
+
+```text
+1. scratchpad 可能很长
+2. observation 可能很长
+3. 内部执行细节不一定适合暴露
+4. 对外接口应该稳定、简洁
+```
+
+一句话：
+
+```text
+内部数据结构不等于对外 API 结构。
+```
+
+---
+
+## 116. Agent 日志 jsonl
+
+为了方便排查 Agent 的运行过程，今天新增了日志保存。
+
+日志文件：
+
+```text
+logs/agent_runs.jsonl
+```
+
+`.jsonl` 的意思是：
+
+```text
+JSON Lines
+一行就是一个完整 JSON
+```
+
+它适合日志，因为可以不断追加：
+
+```json
+{"created_at":"...","user_message":"...","result":{...}}
+{"created_at":"...","user_message":"...","result":{...}}
+```
+
+保存函数：
+
+```python
+def save_agent_run(user_message: str, result) -> None:
+```
+
+记录内容：
+
+```text
+created_at：运行时间
+user_message：用户输入
+result：完整 AgentResult
+```
+
+查看日志：
+
+```powershell
+Get-Content .\logs\agent_runs.jsonl -Tail 5
+```
+
+---
+
+## 117. view_agent_logs.py
+
+今天新增了：
+
+```text
+view_agent_logs.py
+```
+
+作用：
+
+```text
+读取 logs/agent_runs.jsonl
+打印每次 Agent 运行摘要
+```
+
+运行：
+
+```powershell
+python .\view_agent_logs.py
+```
+
+输出类似：
+
+```text
+Run #1
+created_at: ...
+user_message: ...
+answer: ...
+steps: 2
+errors: 0
+```
+
+如果有错误，会打印：
+
+```text
+error_details:
+- step=2 error=repeated tool call
+```
+
+这个脚本属于工程里的辅助排查工具。
+
+---
+
+## 118. 今天 Agent 工程化小结
+
+今天的核心不是让 Agent 更聪明，而是让 Agent 更可控、更可观察。
+
+目前链路：
+
+```text
+用户请求
+-> FastAPI /agent/chat
+-> run_agent()
+-> LLM 决策
+-> 工具调用
+-> AgentResult
+-> 保存完整 jsonl 日志
+-> 返回简化 API 响应
+```
+
+今天形成的工程能力：
+
+```text
+1. 有状态：AgentState
+2. 有结构：AgentResult
+3. 有边界：max_steps + 防重复调用
+4. 有接口：/agent/chat
+5. 有日志：agent_runs.jsonl
+6. 有查看工具：view_agent_logs.py
+```
+
+一句话总结：
+
+```text
+Agent 工程化的第一步，是把每一步做了什么记录清楚，并用代码限制它不要乱跑。
+```
+
+---
+
+## 119. 接口工程化：run_id
+
+今天开始做 Agent 的接口工程化。
+
+第一步是给每次 Agent 运行增加：
+
+```text
+run_id
+```
+
+`run_id` 的作用：
+
+```text
+给每一次 Agent 调用一个唯一编号。
+```
+
+为什么需要：
+
+```text
+1. /agent/chat 返回 run_id
+2. 日志里保存 run_id
+3. 后面可以根据 run_id 查询这次运行详情
+4. 用户反馈某次回答有问题时，可以精确定位
+```
+
+生成方式：
+
+```python
+def generate_run_id() -> str:
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%d%H%M%S")
+    suffix = uuid4().hex[:8]
+    return f"run_{timestamp}_{suffix}"
+```
+
+示例：
+
+```text
+run_20260710123456_ab12cd34
+```
+
+其中：
+
+```text
+20260710123456：时间
+ab12cd34：随机短 ID
+```
+
+这样既方便人看，也能降低重复概率。
+
+---
+
+## 120. agent_run_store.py
+
+为了避免 `api_server.py` 越来越乱，今天新增了：
+
+```text
+agent_run_store.py
+```
+
+它专门负责 Agent 运行记录的存储和读取。
+
+目前包含：
+
+```python
+generate_run_id()
+save_agent_run()
+load_agent_runs()
+find_agent_run()
+```
+
+职责划分：
+
+```text
+api_server.py：负责接口
+agent_run_store.py：负责日志存储和查询
+view_agent_logs.py：负责命令行查看日志
+```
+
+这样做的好处：
+
+```text
+1. api_server.py 更干净
+2. 读写 jsonl 的逻辑只有一份
+3. 后面从 jsonl 换成 SQLite 时，主要改 agent_run_store.py
+4. 多个地方都可以复用日志读取函数
+```
+
+一句话：
+
+```text
+agent_run_store.py 是 Agent 运行记录的存储层。
+```
+
+---
+
+## 121. save_agent_run
+
+`save_agent_run()` 负责把一次 Agent 运行保存到 jsonl 文件。
+
+函数大概结构：
+
+```python
+def save_agent_run(run_id: str, user_message: str, result: Any) -> None:
+    ...
+```
+
+保存内容：
+
+```text
+run_id：本次运行 ID
+created_at：创建时间
+user_message：用户输入
+result：完整 AgentResult
+```
+
+写入文件：
+
+```text
+logs/agent_runs.jsonl
+```
+
+每次保存是一行 JSON：
+
+```json
+{"run_id":"...","created_at":"...","user_message":"...","result":{...}}
+```
+
+`result.model_dump()` 的作用：
+
+```text
+把 Pydantic 模型转换成普通 dict，方便 json.dumps 保存。
+```
+
+---
+
+## 122. load_agent_runs 和 find_agent_run
+
+`load_agent_runs()` 负责读取所有 Agent 运行记录。
+
+基本逻辑：
+
+```text
+1. 如果日志文件不存在，返回空列表
+2. 逐行读取 agent_runs.jsonl
+3. 每一行用 json.loads 转成 dict
+4. 返回 records 列表
+```
+
+`find_agent_run(run_id)` 负责按 run_id 查找某一次运行。
+
+基本逻辑：
+
+```python
+for record in load_agent_runs():
+    if record.get("run_id") == run_id:
+        return record
+
+return None
+```
+
+如果找到，返回完整记录。
+
+如果没找到，返回：
+
+```python
+None
+```
+
+这个函数后面用于：
+
+```text
+GET /agent/runs/{run_id}
+```
+
+---
+
+## 123. GET /agent/runs
+
+今天新增了历史运行摘要接口：
+
+```http
+GET /agent/runs
+```
+
+作用：
+
+```text
+查看最近的 Agent 运行记录摘要。
+```
+
+返回内容：
+
+```python
+class AgentRunSummary(BaseModel):
+    run_id: str | None
+    created_at: str | None
+    user_message: str | None
+    answer: str | None
+    steps_count: int
+    errors_count: int
+```
+
+示例返回：
+
+```json
+[
+  {
+    "run_id": "run_20260710123456_ab12cd34",
+    "created_at": "2026-07-10T...",
+    "user_message": "根据我的学习笔记说一下 RAG",
+    "answer": "...",
+    "steps_count": 2,
+    "errors_count": 0
+  }
+]
+```
+
+注意：
+
+```text
+这个接口只返回摘要，不返回完整 scratchpad、tool_calls、observation。
+```
+
+因为列表接口应该轻量。
+
+---
+
+## 124. GET /agent/runs/{run_id}
+
+今天新增了运行详情接口：
+
+```http
+GET /agent/runs/{run_id}
+```
+
+作用：
+
+```text
+根据 run_id 查看某一次 Agent 的完整运行记录。
+```
+
+核心逻辑：
+
+```python
+record = find_agent_run(run_id)
+if record is None:
+    raise HTTPException(status_code=404, detail="Agent run not found.")
+return record
+```
+
+如果找到，返回完整记录：
+
+```json
+{
+  "run_id": "...",
+  "created_at": "...",
+  "user_message": "...",
+  "result": {
+    "answer": "...",
+    "state": {
+      "scratchpad": [],
+      "tool_calls": [],
+      "steps": [],
+      "errors": []
+    }
+  }
+}
+```
+
+如果没找到，返回：
+
+```json
+{
+  "detail": "Agent run not found."
+}
+```
+
+状态码：
+
+```text
+404
+```
+
+---
+
+## 125. view_agent_logs.py 复用存储模块
+
+之前 `view_agent_logs.py` 自己读取 jsonl。
+
+现在改成复用：
+
+```python
+from agent_run_store import load_agent_runs
+```
+
+这样：
+
+```text
+读取日志的逻辑只在 agent_run_store.py 里维护。
+```
+
+`view_agent_logs.py` 只负责展示：
+
+```text
+run_id
+created_at
+user_message
+answer
+steps 数量
+errors 数量
+```
+
+这体现了一个工程习惯：
+
+```text
+同一份逻辑不要在多个文件里重复写。
+```
+
+---
+
+## 126. 接口工程化阶段小结
+
+这轮接口工程化完成后，目前后端接口有：
+
+```text
+GET  /health
+POST /chat
+POST /agent/chat
+GET  /agent/runs
+GET  /agent/runs/{run_id}
+```
+
+整体链路：
+
+```text
+用户调用 /agent/chat
+-> 生成 run_id
+-> run_agent() 执行多步 Agent
+-> 保存完整运行记录到 agent_runs.jsonl
+-> 返回 answer、steps、errors、run_id
+```
+
+历史查询链路：
+
+```text
+GET /agent/runs
+-> 返回运行摘要列表
+
+GET /agent/runs/{run_id}
+-> 返回某次完整运行详情
+```
+
+目前形成的工程能力：
+
+```text
+1. 每次运行可追踪：run_id
+2. 运行记录可持久化：jsonl
+3. 历史记录可查询：/agent/runs
+4. 单次详情可查看：/agent/runs/{run_id}
+5. 存储逻辑独立：agent_run_store.py
+```
+
+一句话总结：
+
+```text
+接口工程化的核心，是让一次 Agent 调用不仅能返回答案，还能被记录、查询和追踪。
+```
