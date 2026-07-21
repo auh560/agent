@@ -6,3 +6,5 @@ logs/
 .env
 vector_index.json
 vector_index/
+# Flowchart Agent 使用独立 Git 仓库
+/agent_program/

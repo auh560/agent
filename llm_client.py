@@ -51,7 +51,11 @@ class LLMResponseError(Exception):
     pass
 
 
-def call_llm(messages: list[ChatMessage]) -> LLMResult:
+def call_llm(
+    messages: list[ChatMessage],
+    temperature: float | None = None,
+    max_tokens: int | None = None,
+) -> LLMResult:
     settings = get_settings()
 
     if not settings.openai_api_key:
@@ -60,8 +64,8 @@ def call_llm(messages: list[ChatMessage]) -> LLMResult:
     request_body = {
         "model": settings.openai_model,
         "messages": [message.to_dict() for message in messages],
-        "temperature": settings.temperature,
-        "max_tokens": settings.max_tokens,
+        "temperature": settings.temperature if temperature is None else temperature,
+        "max_tokens": settings.max_tokens if max_tokens is None else max_tokens,
     }
 
     data = json.dumps(request_body).encode("utf-8")
